@@ -25,7 +25,7 @@ async function siteGet(path) {
 async function siteJson(path) { return (await siteGet(path)).json(); }
 async function siteHtml(path) { return (await siteGet(path)).text(); }
 
-// ─── Puppeteer — reuse browser across requests ───────────────────────────
+// ─── Puppeteer ────────────────────────────────────────────────────────────
 let _browser = null;
 async function getBrowser() {
     if (_browser) {
@@ -78,7 +78,7 @@ async function extractStream(embedUrl) {
     }
 }
 
-// ─── M3U8 proxy — rewrites segment URLs for cross-origin playback ─────────
+// ─── M3U8 proxy ───────────────────────────────────────────────────────────
 async function proxyM3u8(m3u8Url, referer, res) {
     const r = await fetch(m3u8Url, {
         headers: { "User-Agent": UA, "Referer": referer || "https://megacloud.blog/" },
@@ -152,20 +152,45 @@ app.get("/api/search", async (req, res) => {
 });
 
 // ─── GET /api/episodes/:slug ──────────────────────────────────────────────
+// The <a> tags look like:
+// <a title="Ep Title" class="ssl-item ep-item" data-number="1" data-id="102662" href="...">
 app.get("/api/episodes/:slug", async (req, res) => {
     const { slug } = req.params;
     try {
         const d = await siteJson(`/ajax/v2/episode/list/${slug}`);
         if (!d.html) throw new Error("No episode HTML");
-        const items = [...d.html.matchAll(/<a[^>]*data-id="(\d+)"[^>]*data-number="(\d+)"[^>]*(?:title="([^"]*)")?[^>]*>/g)];
-        const episodes = items.map(m => ({
-            id: m[1], episodeId: m[1],
-            number: parseInt(m[2]), episode: parseInt(m[2]),
-            title: m[3] || `Episode ${m[2]}`,
-            slug: `${slug}-episode-${m[2]}`
-        }));
+
+        // Match multiline <a> blocks with data-number and data-id as separate attributes
+        const items = [...d.html.matchAll(/<a[^>]*\bdata-number="(\d+)"[^>]*\bdata-id="(\d+)"[^>]*>/gs)];
+
+        // Also try reversed attribute order just in case
+        const items2 = [...d.html.matchAll(/<a[^>]*\bdata-id="(\d+)"[^>]*\bdata-number="(\d+)"[^>]*>/gs)];
+
+        // Extract title from the title="..." attribute on the same <a> tag
+        const episodes = items.length ? items.map(m => {
+            const titleMatch = m[0].match(/\btitle="([^"]+)"/);
+            return {
+                id: m[2], episodeId: m[2],
+                number: parseInt(m[1]), episode: parseInt(m[1]),
+                title: titleMatch ? titleMatch[1] : `Episode ${m[1]}`,
+                slug: `${slug}-episode-${m[1]}`
+            };
+        }) : items2.map(m => {
+            const titleMatch = m[0].match(/\btitle="([^"]+)"/);
+            return {
+                id: m[1], episodeId: m[1],
+                number: parseInt(m[2]), episode: parseInt(m[2]),
+                title: titleMatch ? titleMatch[1] : `Episode ${m[2]}`,
+                slug: `${slug}-episode-${m[2]}`
+            };
+        });
+
+        console.log(`[EPISODES] slug=${slug} found=${episodes.length}`);
         res.json({ success: true, episodes, data: episodes });
-    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+    } catch (e) {
+        console.error("[EPISODES] error:", e.message);
+        res.status(500).json({ success: false, error: e.message });
+    }
 });
 
 // ─── GET /api/stream/:epId ────────────────────────────────────────────────
@@ -185,13 +210,16 @@ app.get("/api/stream/:epId", async (req, res) => {
             name:     b[1].replace(/<[^>]+>/g, "").trim()
         })).filter(s => s.slotId && s.type === serverType);
 
+        console.log(`[STREAM] epId=${epId} servers:`, servers.map(s => s.name + "("+s.serverId+")"));
+
+        // Prefer non-MegaCloud (id !== 1), fall back to anything
         const server = servers.find(s => s.serverId !== "1") || servers[0];
         if (!server) throw new Error("No servers for type: " + serverType);
 
         const srcData = await siteJson(`/ajax/v2/episode/sources?id=${server.slotId}`);
         const embedUrl = srcData.link;
         if (!embedUrl) throw new Error("No embed link");
-        console.log(`[STREAM] epId=${epId} server=${server.name} embed=${embedUrl}`);
+        console.log(`[STREAM] server=${server.name} embed=${embedUrl}`);
 
         const streamUrl = await extractStream(embedUrl);
         if (!streamUrl) throw new Error("Could not extract stream");
